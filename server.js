@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-
+import nodemailer from "nodemailer";
 import express from "express";
 import cors from "cors";
 import path from "path";
@@ -8,10 +8,19 @@ import fs from "fs";
 import { query } from "./db.js";
 dotenv.config();
 
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const otpStore = {};
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASSWORD
+  }
+});
 app.use(cors());
 app.use(express.json());
 
@@ -490,7 +499,7 @@ app.post("/api/login", async (req, res) => {
     const sql = `SELECT ${identityCol} AS identity, ${passwordCol} AS password FROM ${tableFq} WHERE lower(${identityCol}) = lower($1) LIMIT 1`;
     const { rows } = await query(sql, [identity]);
     if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
-    const ok = String(rows[0].password) === String(password);
+    const ok = String(password) === String(rows[0].password);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
     await ensureRolesTable();
     res.json({ status: "ok", user: { username: identity } });
@@ -502,18 +511,76 @@ app.post("/api/login", async (req, res) => {
 
 app.post("/api/forgot", async (req, res) => {
   try {
-    const { username } = req.body || {};
-    if (!username) return res.status(400).json({ error: "Username required" });
-    const { tableFq, identityCol, passwordCol } = await getHrLoginMeta();
-    if (!tableFq || !identityCol || !passwordCol) return res.status(500).json({ error: "hrlogin table missing expected columns" });
-    const checkSql = `SELECT 1 FROM ${tableFq} WHERE lower(${identityCol}) = lower($1)`;
-    const { rows } = await query(checkSql, [username]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    const updSql = `UPDATE ${tableFq} SET ${passwordCol} = $1 WHERE lower(${identityCol}) = lower($2)`;
-    await query(updSql, ["password123", username]);
-    res.json({ status: "ok", message: "Password reset to password123" });
+    const { username } = req.body || {}
+
+    if (!username)
+      return res.status(400).json({ error: "Username required" })
+
+    const { tableFq, identityCol } = await getHrLoginMeta()
+
+    const checkSql = `
+      SELECT 1
+      FROM ${tableFq}
+      WHERE lower(${identityCol}) = lower($1)
+      LIMIT 1
+    `
+
+    const { rows } = await query(checkSql, [username])
+
+    if (!rows.length)
+      return res.status(404).json({ error: "User not found" })
+
+    // ✅ ONLY VERIFY USER — DO NOT CHANGE PASSWORD
+    res.json({ status: "ok", message: "User verified" })
+
   } catch (err) {
-    console.error("Forgot password failed", err.message);
+    console.error("Forgot password failed", err.message)
+    res.status(500).json({ error: `Reset error: ${err.message}` })
+  }
+})
+
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { username, newPassword } = req.body || {};
+
+    if (!username) return res.status(400).json({ error: "Username required" });
+    if (!newPassword) return res.status(400).json({ error: "New password required" });
+
+    // ✅ Get all needed columns ONE TIME
+    const { tableFq, identityCol, passwordCol, emailCol } = await getHrLoginMeta();
+
+    const updSql = `
+      UPDATE ${tableFq}
+      SET ${passwordCol} = $1
+      WHERE lower(${identityCol}) = lower($2)
+    `;
+
+    await query(updSql, [newPassword, username]);
+
+    // 🔎 Fetch email after password change
+    const emailSql = `
+      SELECT ${emailCol} AS email
+      FROM ${tableFq}
+      WHERE lower(${identityCol}) = lower($1)
+      LIMIT 1
+    `;
+
+    const emailRes = await query(emailSql, [username]);
+    const userEmail = emailRes.rows[0]?.email;
+
+    if (userEmail) {
+      await transporter.sendMail({
+        from: process.env.MAIL_USER,
+        to: userEmail,
+        subject: "Password Changed Successfully",
+        text: "Your password has been changed successfully. If this wasn't you, contact admin immediately."
+      });
+    }
+
+    res.json({ status: "ok", message: "Password updated successfully" });
+
+  } catch (err) {
+    console.error("Reset password failed", err.message);
     res.status(500).json({ error: `Reset error: ${err.message}` });
   }
 });
@@ -538,6 +605,129 @@ app.post("/api/change_password", async (req, res) => {
   } catch (err) {
     console.error("Change password failed", err.message);
     res.status(500).json({ error: `Change password error: ${err.message}` });
+  }
+});
+
+app.post("/api/send-otp", async (req, res) => {
+  try {
+    const { username, email } = req.body || {};
+
+    if (!username)
+      return res.status(400).json({ error: "Username required" });
+
+    const { tableFq, identityCol, emailCol } = await getHrLoginMeta();
+
+    if (!tableFq || !identityCol || !emailCol)
+      return res.status(500).json({ error: "hrlogin missing username/email columns" });
+
+    // ✅ Check if user exists
+    const sql = `
+      SELECT ${emailCol} AS email
+      FROM ${tableFq}
+      WHERE lower(${identityCol}) = lower($1)
+      LIMIT 1
+    `;
+
+    const { rows } = await query(sql, [username]);
+
+if (!rows.length)
+  return res.status(404).json({ error: "User not found" });
+
+const dbEmail = String(rows[0].email || "").toLowerCase().trim();
+const inputEmail = String(email || "").toLowerCase().trim();
+
+// ❌ Email mismatch → STOP HERE
+if (!inputEmail || dbEmail !== inputEmail) {
+  return res.status(400).json({ error: "Email does not match registered email" });
+}
+
+const userEmail = rows[0].email;
+
+    // ✅ Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // ✅ Store OTP in memory (5 min expiry)
+    otpStore[username] = {
+      otp,
+      expires: Date.now() + 5 * 60 * 1000
+    };
+
+    console.log("OTP for", username, "=", otp); // TEMP DEBUG
+    await transporter.sendMail({
+    from: process.env.MAIL_USER,
+     to: userEmail,
+    subject: "Password Reset OTP",
+     text: `Your OTP is: ${otp}. It will expire in 5 minutes.`
+});
+    res.json({
+      status: "ok",
+      message: "OTP generated",
+      email
+    });
+
+  } catch (err) {
+    console.error("Send OTP failed", err.message);
+    res.status(500).json({ error: `OTP error: ${err.message}` });
+  }
+});
+
+app.post("/api/verify-otp", async (req, res) => {
+  try {
+    const { username, otp } = req.body || {};
+
+    if (!username || !otp)
+      return res.status(400).json({ error: "Username and OTP required" });
+
+    const record = otpStore[username];
+
+    if (!record)
+      return res.status(400).json({ error: "OTP not requested" });
+
+    // ⏱ Expiry check
+    if (Date.now() > record.expires) {
+      delete otpStore[username];
+      return res.status(400).json({ error: "OTP expired" });
+    }
+
+    // ❌ Wrong OTP
+    if (record.otp !== otp)
+      return res.status(400).json({ error: "Invalid OTP" });
+
+    // ✅ SUCCESS
+    delete otpStore[username];
+
+    res.json({ status: "ok", message: "OTP verified" });
+
+  } catch (err) {
+    console.error("Verify OTP failed", err.message);
+    res.status(500).json({ error: "OTP verification error" });
+  }
+});
+
+/**
+ * Logout endpoint - invalidates session
+ * For future use with session tokens, this would blacklist/invalidate the token
+ * Currently just acknowledges the logout from frontend
+ */
+app.post("/api/logout", async (req, res) => {
+  try {
+    const { username } = req.body || {};
+    if (!username) {
+      return res.status(400).json({ error: "Username required" });
+    }
+    
+    // Log the logout event for security audit purposes
+    console.log(`[Auth] User logged out: ${username} at ${new Date().toISOString()}`);
+    
+    // In a production system with JWT/sessions, you would:
+    // 1. Blacklist the token in Redis
+    // 2. Invalidate the session in the database
+    // 3. Log the event to security audit table
+    
+    res.json({ status: "ok", message: "Logged out successfully" });
+  } catch (err) {
+    console.error("Logout failed", err.message);
+    res.status(500).json({ error: `Logout error: ${err.message}` });
   }
 });
 
@@ -645,7 +835,10 @@ app.get("/api/users", async (_req, res) => {
     res.status(500).json({ error: `Users error: ${err.message}` });
   }
 });
-
+app.get("/api/debug-perms/:username", async (req, res) => {
+  const perms = await getPermissions(req.params.username);
+  res.json(perms);
+});
 // Serve React app for all non-API routes
 app.get("*", (_req, res) => {
   const indexPath = path.join(frontendDistDir, "index.html");
@@ -669,5 +862,4 @@ async function init() {
     console.log(`Appraisal Dashboard server running on http://localhost:${port}/`);
   });
 }
-
 init();
