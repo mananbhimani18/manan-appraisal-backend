@@ -10,7 +10,7 @@ dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
+const SERVER_START_TIME = Date.now();
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -671,6 +671,10 @@ app.get("/api/users", async (_req, res) => {
     console.error("List users failed", err.message);
     res.status(500).json({ error: `Users error: ${err.message}` });
   }
+});
+
+app.get("/api/server-time", (req, res) => {
+  res.json({ startTime: SERVER_START_TIME });
 });
 
 // Serve React app for all non-API routes
