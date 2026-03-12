@@ -2,11 +2,20 @@ import dotenv from "dotenv";
 
 import express from "express";
 import cors from "cors";
+const otpStore = new Map();
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import { query } from "./db.js";
+import nodemailer from "nodemailer";
 dotenv.config();
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASSWORD
+  }
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -503,21 +512,164 @@ app.post("/api/login", async (req, res) => {
 app.post("/api/forgot", async (req, res) => {
   try {
     const { username } = req.body || {};
-    if (!username) return res.status(400).json({ error: "Username required" });
-    const { tableFq, identityCol, passwordCol } = await getHrLoginMeta();
-    if (!tableFq || !identityCol || !passwordCol) return res.status(500).json({ error: "hrlogin table missing expected columns" });
-    const checkSql = `SELECT 1 FROM ${tableFq} WHERE lower(${identityCol}) = lower($1)`;
+
+    if (!username) {
+      return res.status(400).json({ error: "Username required" });
+    }
+
+    const { tableFq, identityCol } = await getHrLoginMeta();
+
+    if (!tableFq || !identityCol) {
+      return res.status(500).json({ error: "hrlogin table missing expected columns" });
+    }
+
+    const checkSql = `
+      SELECT 1 FROM ${tableFq}
+      WHERE lower(${identityCol}) = lower($1)
+    `;
+
     const { rows } = await query(checkSql, [username]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    const updSql = `UPDATE ${tableFq} SET ${passwordCol} = $1 WHERE lower(${identityCol}) = lower($2)`;
-    await query(updSql, ["password123", username]);
-    res.json({ status: "ok", message: "Password reset to password123" });
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // only confirm user exists
+    res.json({ message: "User found" });
+
   } catch (err) {
     console.error("Forgot password failed", err.message);
-    res.status(500).json({ error: `Reset error: ${err.message}` });
+    res.status(500).json({ error: "Forgot password error" });
+  }
+});
+app.post("/api/send-otp", async (req, res) => {
+  try {
+    const { username, email } = req.body;
+
+    if (!username || !email) {
+      return res.status(400).json({ error: "Username and email required" });
+    }
+
+    const { tableFq, identityCol, emailCol } = await getHrLoginMeta();
+
+    if (!tableFq || !identityCol || !emailCol) {
+      return res.status(500).json({ error: "Email column not found in hrlogin table" });
+    }
+
+    // check if user exists
+    const sql = `SELECT ${emailCol} FROM ${tableFq} WHERE lower(${identityCol}) = lower($1)`;
+    const { rows } = await query(sql, [username]);
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+const userEmail = rows[0][Object.keys(rows[0])[0]];
+
+   if (!userEmail || userEmail.toLowerCase() !== email.toLowerCase()) {
+  return res.status(401).json({ error: "Invalid email" });
+}
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+otpStore.set(username, {
+  code: otp,
+  expires: Date.now() + 5 * 60 * 1000
+});
+
+await transporter.sendMail({
+  from: process.env.MAIL_USER,
+  to: email,
+  subject: "OTP Verification",
+  text: `Your OTP is: ${otp}. It will expire in 5 minutes.`
+});
+    // TODO: send email using nodemailer later
+
+    res.json({ message: "OTP sent successfully" });
+
+  } catch (err) {
+    console.error("Send OTP failed", err);
+    res.status(500).json({ error: "OTP send failed" });
+  }
+});
+app.post("/api/verify-otp", async (req, res) => {
+  try {
+    const { username, otp } = req.body;
+
+    const data = otpStore.get(username);
+
+if (!data) {
+  return res.status(400).json({ error: "OTP not found" });
+}
+
+if (Date.now() > data.expires) {
+  otpStore.delete(username);
+  return res.status(400).json({ error: "OTP expired" });
+}
+
+if (data.code !== otp) {
+  return res.status(401).json({ error: "Invalid OTP" });
+}
+otpStore.set(username, { verified: true });
+
+res.json({ message: "OTP verified" });
+
+  } catch (err) {
+    console.error("OTP verify failed", err);
+    res.status(500).json({ error: "OTP verification failed" });
   }
 });
 
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { username, newPassword } = req.body;
+   const otpData = otpStore.get(username);
+
+    if (!otpData || !otpData.verified) {
+      return res.status(403).json({ error: "OTP verification required" });
+    }
+
+    if (!username || !newPassword) {
+      return res.status(400).json({ error: "Username and password required" });
+    }
+
+    const { tableFq, identityCol, passwordCol, emailCol } = await getHrLoginMeta();
+
+    // Update password
+    const sql = `
+      UPDATE ${tableFq}
+      SET ${passwordCol} = $1
+      WHERE lower(${identityCol}) = lower($2)
+    `;
+
+    await query(sql, [newPassword, username]);
+
+    // Get user's email from DB
+    const emailQuery = `
+      SELECT ${emailCol} AS email
+      FROM ${tableFq}
+      WHERE lower(${identityCol}) = lower($1)
+    `;
+
+    const { rows } = await query(emailQuery, [username]);
+    const userEmail = rows[0]?.email;
+
+    // Send confirmation email
+    if (userEmail) {
+      await transporter.sendMail({
+        from: process.env.MAIL_USER,
+        to: userEmail,
+        subject: "Password Changed",
+        text: "Your password has been changed successfully. If this wasn't you contact admin immediately."
+      });
+    }
+    otpStore.delete(username);
+    res.json({ message: "Password reset successful" });
+
+  } catch (err) {
+    console.error("Reset password failed", err);
+    res.status(500).json({ error: "Password reset failed" });
+  }
+});
 app.post("/api/change_password", async (req, res) => {
   try {
     const { username, current, next } = req.body || {};
