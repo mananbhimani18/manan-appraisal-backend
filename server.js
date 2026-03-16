@@ -6,7 +6,7 @@ const otpStore = new Map();
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
-import { query } from "./db.js";
+import { query, getClient } from "./db.js";
 import nodemailer from "nodemailer";
 dotenv.config();
 const transporter = nodemailer.createTransport({
@@ -109,7 +109,30 @@ app.post("/api/employeedetails", async (req, res) => {
     const placeholders = vals.map((_, i) => `$${i + 1}`).join(", ");
     const sql = `INSERT INTO public.employeedetails (${cols.join(",")}) VALUES (${placeholders}) RETURNING id`;
     const params = vals;
-    const { rows } = await query(sql, params);
+const client = await getClient();
+
+try {
+
+  await client.query("BEGIN");
+
+  await client.query(`SET LOCAL app.actor = '${actor}'`);
+
+  const { rows } = await client.query(sql, params);
+
+  await client.query("COMMIT");
+
+
+} catch (err) {
+
+  await client.query("ROLLBACK");
+  console.error("Add employeedetails failed", err.message);
+  res.status(500).json({ error: `Add employeedetails error: ${err.message}` });
+
+} finally {
+
+  client.release();
+
+}
     res.status(201).json({ id: rows[0].id });
   } catch (err) {
     console.error("Add employeedetails failed", err.message);
@@ -118,12 +141,17 @@ app.post("/api/employeedetails", async (req, res) => {
 });
 
 app.put("/api/employeedetails/:id", async (req, res) => {
+  const client = await getClient();
+
   try {
     const { id } = req.params;
     const { actor, name, department, currentsalary, grade, increment, incrementedsalary } = req.body || {};
+
     if (!actor) return res.status(401).json({ error: "Actor required" });
+
     const allowed = await hasPermission(actor, "update");
     if (!allowed) return res.status(403).json({ error: "Not authorized" });
+
     const fields = [
       ["name", name],
       ["department", department],
@@ -132,16 +160,37 @@ app.put("/api/employeedetails/:id", async (req, res) => {
       ["increment", increment],
       ["incrementedsalary", incrementedsalary]
     ].filter(([_, v]) => v !== undefined);
-    if (!fields.length) return res.status(400).json({ error: "No fields to update" });
+
+    if (!fields.length)
+      return res.status(400).json({ error: "No fields to update" });
+
     const setSql = fields.map((f, i) => `${f[0]} = $${i + 1}`).join(", ");
     const sql = `UPDATE public.employeedetails SET ${setSql} WHERE id = $${fields.length + 1} RETURNING id`;
     const params = [...fields.map(f => f[1]), id];
-    const { rows } = await query(sql, params);
-    if (!rows.length) return res.status(404).json({ error: "Employee not found" });
+
+    await client.query("BEGIN");
+
+    await client.query(`SET LOCAL app.actor = '${actor}'`);
+
+    const { rows } = await client.query(sql, params);
+
+    await client.query("COMMIT");
+
+    if (!rows.length)
+      return res.status(404).json({ error: "Employee not found" });
+
     res.json({ id: rows[0].id });
+
   } catch (err) {
+
+    await client.query("ROLLBACK");
     console.error("Update employeedetails failed", err.message);
     res.status(500).json({ error: `Update employeedetails error: ${err.message}` });
+
+  } finally {
+
+    client.release();
+
   }
 });
 
@@ -149,13 +198,48 @@ app.delete("/api/employeedetails/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { actor } = req.body || {};
+
+    console.log("Deleting employee by:", actor);
+
     if (!actor) return res.status(401).json({ error: "Actor required" });
+
     const allowed = await hasPermission(actor, "delete");
     if (!allowed) return res.status(403).json({ error: "Not authorized" });
-    const { rows } = await query(`DELETE FROM public.employeedetails WHERE id = $1 RETURNING id`, [id]);
-    if (!rows.length) return res.status(404).json({ error: "Employee not found" });
-    res.json({ id: rows[0].id });
+
+const client = await getClient();
+
+try {
+
+  await client.query("BEGIN");
+
+  await client.query(`SET LOCAL app.actor = '${actor}'`);
+
+  const result = await client.query(
+    `DELETE FROM public.employeedetails WHERE id = $1 RETURNING id`,
+    [id]
+  );
+
+  await client.query("COMMIT");
+
+  if (!result.rows.length)
+    return res.status(404).json({ error: "Employee not found" });
+
+  res.json({ id: result.rows[0].id });
+
+} catch (err) {
+
+  await client.query("ROLLBACK");
+  console.error("Delete employeedetails failed", err.message);
+  res.status(500).json({ error: `Delete employeedetails error: ${err.message}` });
+
+} finally {
+
+  client.release();
+
+}
+
   } catch (err) {
+    await query("ROLLBACK");
     console.error("Delete employeedetails failed", err.message);
     res.status(500).json({ error: `Delete employeedetails error: ${err.message}` });
   }
@@ -822,6 +906,34 @@ app.get("/api/users", async (_req, res) => {
   } catch (err) {
     console.error("List users failed", err.message);
     res.status(500).json({ error: `Users error: ${err.message}` });
+  }
+});
+
+app.get("/api/activitylog", async (req, res) => {
+  try {
+    const username = req.headers["x-user"];
+
+    if (!username) {
+      return res.status(401).json({ error: "User required" });
+    }
+
+    const role = await getUserRole(username);
+
+    if (role !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+
+    const { rows } = await query(`
+      SELECT id, actor, action, target, created_at
+      FROM activitylog
+      ORDER BY created_at DESC
+      LIMIT 200
+    `);
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Activity log fetch failed", err.message);
+    res.status(500).json({ error: "Failed to fetch activity log" });
   }
 });
 
